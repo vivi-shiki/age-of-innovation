@@ -1,0 +1,58 @@
+/* Age of Innovation — play.css (Phase 0 skeleton) */
+
+/* ── Layout ─────────────────────────────────────────────── */
+
+body {
+	background: #1a2e1a;
+	color: #e8e0d0;
+	margin: 0;
+	padding: 0;
+}
+
+main {
+	display: flex;
+	justify-content: center;
+	align-items: flex-start;
+	padding: 8px;
+}
+
+/* ── Map canvas ──────────────────────────────────────────── */
+
+#map-area {
+	position: relative;
+}
+
+#map-canvas {
+	display: block;
+	border: 2px solid #4a6a4a;
+	border-radius: 4px;
+}
+
+/* ── Terrain colours (hex fill) ──────────────────────────── */
+
+.hex-yellow  { fill: #e8c84a; }
+.hex-brown   { fill: #8b5e3c; }
+.hex-black   { fill: #2a2a2a; }
+.hex-blue    { fill: #3a6ea8; }
+.hex-green   { fill: #3a8a3a; }
+.hex-gray    { fill: #888888; }
+.hex-red     { fill: #c04030; }
+.hex-white   { fill: #b0c8e0; }   /* river */
+
+/* ── Faction colours ─────────────────────────────────────── */
+
+.faction-swarmlings   { color: #2a2a2a; }
+.faction-dwarves      { color: #888888; }
+.faction-engineers    { color: #888888; }
+.faction-alchemists   { color: #2a2a2a; }
+.faction-darklings    { color: #2a2a2a; }
+.faction-halflings    { color: #8b5e3c; }
+.faction-cultists     { color: #8b5e3c; }
+.faction-giants       { color: #c04030; }
+.faction-fakirs       { color: #e8c84a; }
+.faction-nomads       { color: #e8c84a; }
+.faction-auren        { color: #3a8a3a; }
+.faction-witches      { color: #3a8a3a; }
+.faction-mermaids     { color: #3a6ea8; }
+.faction-riverwalkers { color: #3a6ea8; }
+.faction-chaosmagicians { color: #c04030; }
