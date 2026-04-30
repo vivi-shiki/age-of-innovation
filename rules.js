@@ -2,12 +2,12 @@
 
 // ============================================================
 // Age of Innovation — rules.js
-// RTT module — Phase 3 / Step 3.1: resource system
+// RTT module — Phase 3 / Step 3.2: map ops + initial dwellings
 // ============================================================
 
 // ── Data imports ──────────────────────────────────────────────────────────────
 
-const { MAP_HEXES } = require("./data/map.js")
+const { MAP_HEXES, ADJACENCY } = require("./data/map.js")
 const {
 	BONUS_TILES, FAVOR_TILES, TOWN_TILES, SCORING_TILES,
 	BONUS_TILE_NAMES, SCORING_TILE_NAMES,
@@ -17,6 +17,9 @@ const {
 	COLOR_WHEEL,
 	CULT_TRACKS,
 	CULT_TRACK_POWER_GAINS,
+	BUILDING_STRENGTH,
+	DEFAULT_TOWN_SIZE,
+	DEFAULT_TOWN_COUNT,
 } = require("./data/constants.js")
 const { FACTIONS, BASE_FACTIONS, FIRE_ICE_FACTIONS } = require("./data/factions.js")
 
@@ -160,6 +163,8 @@ exports.action = function (state, role, action, arg) {
 	switch (action) {
 		case "select_faction":
 			return _action_select_faction(state, role, arg)
+		case "place_dwelling":
+			return _action_place_dwelling(state, role, arg)
 		default:
 			throw new Error(`Unknown action: ${action}`)
 	}
@@ -363,6 +368,155 @@ function _begin_initial_dwellings(G) {
 	G.active = G.action_queue[0].role
 }
 
+// ── Initial dwelling placement ────────────────────────────────────────────────
+
+/**
+ * Transition from initial dwelling placement to bonus-tile selection.
+ * Players pick bonus tiles in reverse turn order.
+ */
+function _begin_initial_bonus(G) {
+	G.state = "initial-bonus"
+	const reverse_order = G.turn_order.slice().reverse()
+	G.action_queue = reverse_order.map(role => ({ role, type: "pick-bonus" }))
+	G.active = G.action_queue[0].role
+}
+
+/**
+ * Handle the place_dwelling action (state: "initial-dwellings").
+ * arg = hex key string, e.g. "A1"
+ *
+ * Validation:
+ *   – must be in initial-dwellings phase
+ *   – hex must be a non-empty string, must exist in G.map, must not be a river
+ *   – hex must be empty (no existing building)
+ *   – hex color must match the faction's home terrain color
+ *
+ * On success: places a D, updates faction state, advances the queue.
+ * No leech or town-detection during initial placement (setup phase).
+ */
+function _action_place_dwelling(G, role, hex) {
+	if (G.state !== "initial-dwellings")
+		throw new Error("Not in dwelling placement phase.")
+	if (typeof hex !== "string" || !hex)
+		throw new Error("Invalid hex.")
+	const cell = G.map[hex]
+	if (!cell || cell.river)
+		throw new Error("Invalid hex.")
+	if (cell.building !== null)
+		throw new Error(`Hex '${hex}' already has a building.`)
+
+	const fs = G.factions[role]
+	if (fs.color === null)
+		throw new Error("Faction has not selected a home terrain color.")
+	if (cell.color !== fs.color)
+		throw new Error(`Hex '${hex}' is not your home terrain.`)
+
+	// Place the dwelling
+	cell.building = "D"
+	cell.faction  = role
+	fs.buildings.D++
+	fs.locations.push(hex)
+
+	// Advance the action queue
+	G.action_queue.shift()
+	if (G.action_queue.length > 0) {
+		G.active = G.action_queue[0].role
+	} else {
+		_begin_initial_bonus(G)
+	}
+
+	return G
+}
+
+// ── Map operations ────────────────────────────────────────────────────────────
+
+/**
+ * Push leech decisions onto the action queue for every faction that has a
+ * building adjacent to `hex` and is not the active faction.
+ *
+ * Each queued entry: { role, type: "leech", amount, from_role }
+ * where `amount` = BUILDING_STRENGTH of the adjacent building.
+ *
+ * Called after any build/upgrade during the main play phase.
+ * NOT called during initial dwelling placement.
+ */
+function _compute_leech(G, active_role, hex) {
+	for (const adj of ADJACENCY[hex]) {
+		const cell = G.map[adj]
+		if (cell.building && cell.faction !== active_role) {
+			G.action_queue.push({
+				role: cell.faction,
+				type: "leech",
+				amount: BUILDING_STRENGTH[cell.building],
+				from_role: active_role,
+			})
+		}
+	}
+}
+
+/**
+ * BFS from `hex` to find all connected same-faction buildings.
+ * If the cluster meets the town conditions (count ≥ 4, strength ≥ 7 by
+ * default, reduced by FAV5 via fs.TOWN_SIZE) and is not already a town,
+ * form a new town: award a town tile, gain its reward, mark hexes.
+ *
+ * Town-size threshold can be modified per faction via FAV5:
+ *   _gain(fs, { TOWN_SIZE: -1 }) stores –1 in fs.TOWN_SIZE;
+ *   we add that delta to DEFAULT_TOWN_SIZE when checking.
+ */
+function _detect_towns(G, role, hex) {
+	const cell = G.map[hex]
+	if (!cell || !cell.building || cell.faction !== role) return
+
+	const fs = G.factions[role]
+
+	// BFS — find connected component of same-faction buildings
+	const cluster = []
+	const visited = new Set([hex])
+	const queue   = [hex]
+	let   total_strength = 0
+
+	while (queue.length > 0) {
+		const current = queue.shift()
+		cluster.push(current)
+		total_strength += BUILDING_STRENGTH[G.map[current].building]
+
+		for (const adj of ADJACENCY[current]) {
+			if (!visited.has(adj)) {
+				visited.add(adj)
+				const adj_cell = G.map[adj]
+				if (adj_cell.building && adj_cell.faction === role) {
+					queue.push(adj)
+				}
+			}
+		}
+	}
+
+	// Town size requirement (FAV5 can reduce default by 1)
+	const size_req  = DEFAULT_TOWN_SIZE + (fs.TOWN_SIZE || 0)
+	if (cluster.length  < DEFAULT_TOWN_COUNT) return
+	if (total_strength  < size_req)           return
+
+	// Skip if this cluster already contains a formed-town hex
+	if (cluster.some(h => G.map[h].town)) return
+
+	// Claim a town tile from the pool
+	const tile_name = Object.keys(TOWN_TILES).find(name => (G.pool[name] || 0) > 0)
+	if (!tile_name) return   // pool exhausted (edge case: no tiles remain)
+
+	G.pool[tile_name]--
+	fs.town_tiles.push(tile_name)
+
+	// Mark all cluster hexes as part of this town
+	for (const h of cluster) {
+		G.map[h].town = true
+		if (!fs.towns.includes(h)) fs.towns.push(h)
+	}
+
+	// Apply the tile's immediate reward
+	_gain(fs, TOWN_TILES[tile_name].gain)
+}
+
 // ── Prompt & actions ──────────────────────────────────────────────────────────
 
 function _prompt_for(state, role) {
@@ -527,4 +681,7 @@ exports._test = {
 	_advance_cult,
 	_terraform_distance,
 	_terraform_cost,
+	_action_place_dwelling,
+	_compute_leech,
+	_detect_towns,
 }
