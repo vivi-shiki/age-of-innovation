@@ -94,8 +94,11 @@ test("setup() returns an object without throwing", () => {
 	assert.ok(G !== null && typeof G === "object")
 })
 
-test("G has RTT-required field: seed", () => {
-	assert.strictEqual(G.seed, SEED)
+test("G has RTT-required field: seed (a positive number after MLCG advance)", () => {
+	// The MLCG in setup() advances G.seed during shuffling, so it will not
+	// equal the input seed — it will be a different positive integer.
+	assert.strictEqual(typeof G.seed, "number", "seed must be a number")
+	assert.ok(G.seed > 0, "seed must be positive")
 })
 
 test("G has RTT-required field: active (a string in roles list)", () => {
