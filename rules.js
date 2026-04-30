@@ -2,7 +2,7 @@
 
 // ============================================================
 // Age of Innovation — rules.js
-// RTT module — Phase 2 / Step 2.1: Game state structure
+// RTT module — Phase 2 / Step 2.2: setup() + faction selection
 // ============================================================
 
 // ── Data imports ──────────────────────────────────────────────────────────────
@@ -153,6 +153,8 @@ exports.action = function (state, role, action, arg) {
 		throw new Error("It is not your turn.")
 
 	switch (action) {
+		case "select_faction":
+			return _action_select_faction(state, role, arg)
 		default:
 			throw new Error(`Unknown action: ${action}`)
 	}
@@ -244,6 +246,118 @@ function _init_bonus_tiles(G, player_count, options) {
 	}
 }
 
+// ── Faction selection ──────────────────────────────────────────────────────────
+
+/**
+ * Handle the select_faction action (state: "select-factions").
+ * arg = faction name string, e.g. "swarmlings"
+ */
+function _action_select_faction(G, role, faction_name) {
+	if (G.state !== "select-factions")
+		throw new Error("Not in faction selection phase.")
+	if (typeof faction_name !== "string" || !faction_name)
+		throw new Error("Faction name must be a non-empty string.")
+	if (!G.available_factions.includes(faction_name))
+		throw new Error(`Faction '${faction_name}' is not available.`)
+	if (role in G.factions)
+		throw new Error(`${role} has already selected a faction.`)
+
+	const faction_def = FACTIONS[faction_name]
+	if (!faction_def)
+		throw new Error(`Unknown faction: '${faction_name}'.`)
+
+	// Create and store the faction state
+	G.factions[role] = _init_faction_state(faction_name, faction_def)
+
+	// Remove from pool of choosable factions
+	G.available_factions = G.available_factions.filter(f => f !== faction_name)
+
+	// Advance to next player, or transition to initial dwelling placement
+	const idx = G.turn_order.indexOf(role)
+	if (idx + 1 < G.turn_order.length) {
+		G.active = G.turn_order[idx + 1]
+	} else {
+		_begin_initial_dwellings(G)
+	}
+
+	return G
+}
+
+/**
+ * Build the initial faction state object from the faction definition.
+ * Called once per player when they select their faction.
+ *
+ * State shape:
+ *   { faction_name, color,
+ *     C, W, P, P1, P2, P3, VP, KEY,
+ *     FIRE, WATER, EARTH, AIR,
+ *     buildings: {D,TP,TE,SH,SA},
+ *     dig_level, ship_level,
+ *     favor_tiles, town_tiles, bonus_tile,
+ *     passed, income_taken, actions_used,
+ *     locations, towns, bridges }
+ */
+function _init_faction_state(faction_name, faction_def) {
+	const s = faction_def.start
+	return {
+		faction_name,
+		color:  faction_def.color,   // null for pick_color factions
+
+		// ── Resources ────────────────────────────────────────────────────
+		C:   s.C,
+		W:   s.W,
+		P:   s.P   || 0,
+		P1:  s.P1,
+		P2:  s.P2,
+		P3:  s.P3  || 0,
+		VP:  s.VP,
+		KEY: 0,
+
+		// ── Cult tracks ──────────────────────────────────────────────────
+		FIRE:  faction_def.cult_start.FIRE,
+		WATER: faction_def.cult_start.WATER,
+		EARTH: faction_def.cult_start.EARTH,
+		AIR:   faction_def.cult_start.AIR,
+
+		// ── Buildings on board (count currently built) ───────────────────
+		buildings: { D: 0, TP: 0, TE: 0, SH: 0, SA: 0 },
+
+		// ── Upgrade levels (from faction definition starting values) ──────
+		dig_level:  faction_def.dig  ? faction_def.dig.level  : 0,
+		ship_level: faction_def.ship ? faction_def.ship.level : 0,
+
+		// ── Tiles held ────────────────────────────────────────────────────
+		favor_tiles: [],
+		town_tiles:  [],
+		bonus_tile:  null,
+
+		// ── Round / turn flags ────────────────────────────────────────────
+		passed:       false,
+		income_taken: false,
+		actions_used: [],   // action keys used this round; reset each round
+
+		// ── Board presence ────────────────────────────────────────────────
+		locations: [],      // hex keys where this faction has built
+		towns:     [],      // hex keys that are part of a formed town
+		bridges:   [],      // placed bridges [{ from, to }, ...]
+	}
+}
+
+/**
+ * Transition from faction selection to initial dwelling placement.
+ * Builds the snake-order action queue: P1 P2 … PN PN … P2 P1
+ */
+function _begin_initial_dwellings(G) {
+	G.state = "initial-dwellings"
+	const forward  = G.turn_order.slice()
+	const backward = G.turn_order.slice().reverse()
+	G.action_queue = [...forward, ...backward].map(role => ({
+		role,
+		type: "place-dwelling",
+	}))
+	G.active = G.action_queue[0].role
+}
+
 // ── Prompt & actions ──────────────────────────────────────────────────────────
 
 function _prompt_for(state, role) {
@@ -254,6 +368,8 @@ function _prompt_for(state, role) {
 	switch (state.state) {
 		case "select-factions":
 			return "Choose your faction."
+		case "initial-dwellings":
+			return "Place a dwelling on your home terrain."
 		default:
 			return "Take your action."
 	}
@@ -262,7 +378,9 @@ function _prompt_for(state, role) {
 function _actions_for(state, role) {
 	switch (state.state) {
 		case "select-factions":
-			return { select_faction: 1 }
+			return { select_faction: state.available_factions.slice() }
+		case "initial-dwellings":
+			return { place_dwelling: 1 }   // arg = hex key; validated in Step 3.2
 		default:
 			return {}
 	}
