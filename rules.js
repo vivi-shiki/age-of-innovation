@@ -2,7 +2,7 @@
 
 // ============================================================
 // Age of Innovation — rules.js
-// RTT module — Phase 2 / Step 2.2: setup() + faction selection
+// RTT module — Phase 3 / Step 3.1: resource system
 // ============================================================
 
 // ── Data imports ──────────────────────────────────────────────────────────────
@@ -12,7 +12,12 @@ const {
 	BONUS_TILES, FAVOR_TILES, TOWN_TILES, SCORING_TILES,
 	BONUS_TILE_NAMES, SCORING_TILE_NAMES,
 } = require("./data/tiles.js")
-const { POWER_ACTIONS } = require("./data/constants.js")
+const {
+	POWER_ACTIONS,
+	COLOR_WHEEL,
+	CULT_TRACKS,
+	CULT_TRACK_POWER_GAINS,
+} = require("./data/constants.js")
 const { FACTIONS, BASE_FACTIONS, FIRE_ICE_FACTIONS } = require("./data/factions.js")
 
 // ── RTT module API ────────────────────────────────────────────────────────────
@@ -384,4 +389,142 @@ function _actions_for(state, role) {
 		default:
 			return {}
 	}
+}
+
+// ── Resource system ────────────────────────────────────────────────────────────
+
+/**
+ * Move `amount` power tokens through the three bowls: P1 → P2 → P3.
+ * Fills P2 from P1 first; remainder fills P3 from P2.
+ * Excess beyond available tokens is silently discarded.
+ * Returns the number of tokens that actually advanced.
+ */
+function _gain_power(fs, amount) {
+	let remaining = amount
+	const from_p1 = Math.min(remaining, fs.P1)
+	fs.P1 -= from_p1; fs.P2 += from_p1; remaining -= from_p1
+	const from_p2 = Math.min(remaining, fs.P2)
+	fs.P2 -= from_p2; fs.P3 += from_p2; remaining -= from_p2
+	return amount - remaining  // actual tokens promoted
+}
+
+/**
+ * Advance a faction on a single cult track by `amount` steps (max 10).
+ * Triggers power-bowl gains when crossing thresholds: 3, 5, 7, 10.
+ * Reaching 10 spends 1 KEY; if the faction holds no KEY the track caps at 9.
+ * Returns the actual number of steps advanced (may be < amount).
+ */
+function _advance_cult(fs, cult, amount) {
+	const old_val = fs[cult]
+	let new_val = Math.min(10, old_val + amount)
+	// Reaching the 10th square requires spending 1 KEY
+	if (new_val === 10 && old_val < 10 && (fs.KEY || 0) < 1) {
+		new_val = 9
+	}
+	fs[cult] = new_val
+	for (const step of CULT_TRACK_POWER_GAINS) {
+		if (old_val <= step.threshold && new_val > step.threshold) {
+			if (step.PW) _gain_power(fs, step.PW)
+			if (step.KEY) fs.KEY = (fs.KEY || 0) + step.KEY  // step.KEY = −1 → spend
+		}
+	}
+	return new_val - old_val
+}
+
+/**
+ * Grant resources to a faction.
+ *   PW                → _gain_power (three-bowl fill)
+ *   FIRE/WATER/EARTH/AIR → _advance_cult (with power bonuses)
+ *   All other keys    → added directly (C, W, P, VP, KEY, SPADE, …)
+ *
+ * @param {object} fs       faction state (G.factions[role])
+ * @param {object} resources  e.g. { C: 2, PW: 3, FIRE: 1 }
+ */
+function _gain(fs, resources) {
+	for (const [type, amount] of Object.entries(resources)) {
+		if (!amount || amount <= 0) continue
+		if (type === "PW") {
+			_gain_power(fs, amount)
+		} else if (CULT_TRACKS.includes(type)) {
+			_advance_cult(fs, type, amount)
+		} else {
+			fs[type] = (fs[type] || 0) + amount
+		}
+	}
+}
+
+/**
+ * Deduct resources from a faction; power (PW) is spent from bowl 3 (P3 → P1).
+ * Validates ALL resources atomically before any deduction.
+ * Throws if any resource is insufficient (no partial payment).
+ *
+ * @param {object} fs       faction state (G.factions[role])
+ * @param {object} resources  e.g. { C: 3, W: 1, PW: 4 }
+ */
+function _pay(fs, resources) {
+	// Validate first (atomic)
+	for (const [type, amount] of Object.entries(resources)) {
+		if (!amount || amount <= 0) continue
+		const have = (type === "PW") ? (fs.P3 || 0) : (fs[type] || 0)
+		if (have < amount)
+			throw new Error(`Not enough ${type}: need ${amount}, have ${have}.`)
+	}
+	// Deduct (only reached when all checks pass)
+	for (const [type, amount] of Object.entries(resources)) {
+		if (!amount || amount <= 0) continue
+		if (type === "PW") {
+			fs.P3 -= amount
+			fs.P1 += amount  // spent power tokens return to bowl 1
+		} else {
+			fs[type] -= amount
+		}
+	}
+}
+
+/**
+ * Circular distance between two terrain colors on the COLOR_WHEEL (length 7).
+ * Returns the shortest path in either direction (0–3).
+ * Throws if either color is unknown.
+ */
+function _terraform_distance(from_color, to_color) {
+	if (from_color === to_color) return 0
+	const a = COLOR_WHEEL.indexOf(from_color)
+	const b = COLOR_WHEEL.indexOf(to_color)
+	if (a === -1) throw new Error(`Unknown terrain color: '${from_color}'.`)
+	if (b === -1) throw new Error(`Unknown terrain color: '${to_color}'.`)
+	const d = Math.abs(a - b)
+	return Math.min(d, COLOR_WHEEL.length - d)
+}
+
+/**
+ * Worker cost to terraform a hex from `from_color` to `to_color`.
+ * Multiplies the faction's dig.cost[dig_level] entry by the terrain distance.
+ * Returns {} when colors are already the same.
+ *
+ * @param {string} from_color   current hex terrain color
+ * @param {string} to_color     target terrain color
+ * @param {object} faction_def  FACTIONS[faction_name]
+ * @param {number} dig_level    current dig upgrade level (0, 1, or 2)
+ * @returns {object} e.g. { W: 6 }
+ */
+function _terraform_cost(from_color, to_color, faction_def, dig_level) {
+	const dist = _terraform_distance(from_color, to_color)
+	if (dist === 0) return {}
+	const cost_per_spade = (faction_def.dig && faction_def.dig.cost[dig_level]) || { W: 3 }
+	const total = {}
+	for (const [res, amt] of Object.entries(cost_per_spade)) {
+		if (amt > 0) total[res] = amt * dist
+	}
+	return total
+}
+
+// ── Test-only exports ─────────────────────────────────────────────────────────
+// Not part of the RTT API; exposed so unit tests can call internal helpers.
+exports._test = {
+	_gain_power,
+	_gain,
+	_pay,
+	_advance_cult,
+	_terraform_distance,
+	_terraform_cost,
 }
