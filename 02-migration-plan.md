@@ -724,31 +724,482 @@ function compute_network_size(G, role) {
 
 #### Step 3.6：特殊派系能力
 
-**目标**：为每种派系实现其特殊机制。  
-**对应原文件**：`src/Game/Factions/*.pm`（逐一移植）
+**目标**：为每种派系实现其特殊机制，并覆盖单元测试。  
+**对应原文件**：`src/Game/Factions/*.pm`（逐一移植）  
+**交付文件**：`rules.js`（内联派系 hook 函数）、`test/test-step-3.6.js`
 
-按复杂度分批实现：
+---
 
-**第一批（规则简单）：**
-- Halflings（极多居所收入）
-- Witches（廉价改造）
-- Nomads（无固定地形）
+##### Step 3.6.1：派系能力框架 + 第一批基础派系
 
-**第二批（中等复杂）：**
-- Swarmlings（廉价居所）
-- Dwarves（隧道穿越）
-- Engineers（桥梁）
-- Mermaids（河流城镇）
+**目标**：搭建派系 hook 机制；实现规则最简单的三种派系：Halflings、Witches、Nomads。
 
-**第三批（高度特殊）：**
-- Cultists（征收转崇拜）
-- Chaosmagicians（特殊初放）
-- Shapeshifters（变色）
-- Riverwalkers（沿河移动）
-- Dragonlords（权力建造）
+**核心架构——派系 hook 系统：**
 
-**Fire & Ice 扩展（最后实现）：**
-- Acolytes, Icemaidens, Yetis
+```javascript
+// rules.js 内部 —— 统一的派系特殊逻辑入口
+// 每个 hook 在对应事件点调用，若派系没有该 hook 则跳过
+
+// 在 do_build / do_upgrade / do_transform 内任何产出铲子时触发
+function on_spade_gained(G, role, hex, count) {
+    const f = G.factions[role]
+    if (f.name === "halflings") {
+        gain(f, { VP: count })                    // 每铲得 1 VP
+    }
+    if (f.name === "alchemists" && f.buildings.SH >= 1) {
+        gain(f, { PW: count * 2 })                // SH 建成后每铲 +2PW
+    }
+}
+
+// 在 end_round() 时对每个派系触发
+function on_pass(G, role) {
+    const f = G.factions[role]
+    if (f.name === "witches" && f.sh_action_used) {
+        // ACTW 重置（已在 new_round 里处理，此处预留扩展点）
+    }
+}
+
+// SH 建成后解锁该派系特殊行动
+function get_faction_special_actions(G, role) {
+    const f = G.factions[role]
+    const actions = {}
+    if (f.name === "witches" && f.buildings.SH >= 1 && !f.sh_action_used) {
+        actions.faction_action = "ACTW"           // 免费建一个居所，无视地形
+    }
+    if (f.name === "nomads" && f.buildings.SH >= 1 && !f.sh_action_used) {
+        actions.faction_action = "ACTN"           // 免费建一个居所（忽略地形颜色）
+    }
+    return actions
+}
+```
+
+**Halflings**（`src/Game/Factions/Halflings.pm`）：
+- 特殊：每使用 1 铲获得 1 VP（`on_spade_gained` hook）
+- SH 解锁：立即获得 3 铲（并触发改造+建造子动作）
+- 挖掘升级费用使用 `{ W:2, C:1, P:1 }`（比标准便宜）
+
+**Witches**（`src/Game/Factions/Witches.pm`）：
+- SH 解锁特殊行动 `ACTW`（每轮重置）：在可达范围内免费建造 1 个居所，忽略地形改造
+- 获得城镇牌时触发 `special.TW*` 奖励：每个城镇额外 +5 VP
+
+**Nomads**（`src/Game/Factions/Nomads.pm`）：
+- SH 解锁特殊行动 `ACTN`（每轮重置）：在可达范围内免费建造 1 个居所，忽略地形
+- 没有固有颜色特权，但 `Nomads` 的 TP 收入曲线不同（C 更高）
+
+**测试重点：**
+- Halflings 挖 3 格时获得 3 VP
+- Witches `ACTW` 可以在非绿色格子建居所
+- 城镇达成时 Witches 额外 +5 VP
+- Nomads `ACTN` 在每轮开始时自动重置可用状态
+
+**验收标准**：
+- `test/test-step-3.6.js` 的 Halflings / Witches / Nomads 测试组通过
+- 上述三族的 SH 特殊行动在行动面板正确出现/消失
+
+---
+
+##### Step 3.6.2：连接型派系——Dwarves、Fakirs、Mermaids
+
+**目标**：实现需要自定义"可到达格子"逻辑的三种派系。
+
+**Dwarves**（`src/Game/Factions/Dwarves.pm`）：
+- 无航运（`ship.max_level = 0`）
+- 隧道（Tunnel）：花费 `W:2`（升级后 `W:1`），在任意己方建筑旁 **穿越一格河流** 到达彼岸建造；距离固定为 1
+- SH 解锁：隧道升级至 level 1（费用降低）；`advance_gain: [{ GAIN_TELEPORT: 1 }]`
+- `is_reachable` 函数需扩展：对 Dwarves 额外检查 `tunnel_range` 内的跨河到达
+
+```javascript
+function is_reachable_dwarves(G, role, hex) {
+    // 遍历所有己方建筑格，检查 hex 是否在隧道范围内（穿过一格 river）
+    for (const loc of G.factions[role].locations) {
+        if (tunnel_adjacent(loc, hex)) return true
+    }
+    return false
+}
+
+function tunnel_adjacent(src, target) {
+    // 两格之间恰好有一格 river 格相隔（即 src 和 target 的 ADJACENCY 共享一个 river 格）
+    for (const mid of ADJACENCY[src]) {
+        if (MAP_HEXES[mid]?.terrain === "river" && ADJACENCY[mid].includes(target)) return true
+    }
+    return false
+}
+```
+
+**Fakirs**（`src/Game/Factions/Fakirs.pm`）：
+- 无航运（`ship.max_level = 0`）
+- 飞毯（Carpet Flight）：花费 `P:1`，在已有建筑旁的 **carpet_range** 格内建造（初始 range=1，升级后 range=2）
+- SH 解锁：飞毯升级，`carpet_range` +1
+- 挖掘只能升到 level 1（`max_level: 1`）
+- `is_reachable` 函数需扩展：检查 BFS 路径长度 ≤ `carpet_range`（仅陆地格，不跨河）
+
+**Mermaids**（`src/Game/Factions/Mermaids.pm`）：
+- 航运起始 level=1，最高 level=5（多于其他派系）
+- 城镇特权：城镇可以"跨越河流"形成（即一组建筑中允许通过河流格连接）
+- SH 解锁：立即提升 1 级航运（`advance_gain: [{ GAIN_SHIP: 1 }]`）
+- `detect_towns` 中对 Mermaids 的 BFS 需要允许经过 river 格
+
+```javascript
+function bfs_component_mermaids(G, role, start, visited) {
+    // 同 bfs_component，但允许经过 terrain==="river" 的格子
+}
+```
+
+**测试重点：**
+- Dwarves 可以隧道到河流对岸（只能穿越 1 格 river）
+- Dwarves 不可以直接到达第 2 个 river 对面
+- Fakirs 飞毯 range=1 时只能到邻近格；range=2 时可到 2 步外
+- Mermaids 城镇可以包含被 river 格分隔的建筑
+
+**验收标准**：
+- Dwarves/Fakirs 的移动测试通过（正向+反向）
+- Mermaids 城镇跨河测试通过
+
+---
+
+##### Step 3.6.3：特殊建造型派系——Engineers、Swarmlings、Giants
+
+**目标**：实现建造成本或建筑规则有显著差异的三种派系。
+
+**Engineers**（`src/Game/Factions/Engineers.pm`）：
+- 建筑成本普遍更低（D: `W:1,C:1`；TP: `W:1,C:2`；TE: `W:1,C:4`；SH/SA: `W:3,C:6`）
+- 内置特殊行动 `ACTE`：花费 `PW:2` 建造 1 座桥（连接两个相邻六边形格子）
+- 桥接规则：桥连接的两格视为相邻（可用于移动到达和城镇判定）
+- 桥梁计入城镇强度（桥 = 强度 1）
+- `bridges` 数组格式：`[{ from: hex1, to: hex2, faction: role }]`
+
+```javascript
+function do_place_bridge(G, role, from_hex, to_hex) {
+    // 验证两格相邻且该派系有 bridge token
+    pay(G.factions[role], { PW: 2 })
+    G.bridges.push({ from: from_hex, to: to_hex, faction: role })
+    log(G, `${role} places a bridge between ${from_hex} and ${to_hex}`)
+    detect_towns(G, role, from_hex)
+    detect_towns(G, role, to_hex)
+}
+```
+
+**Swarmlings**（`src/Game/Factions/Swarmlings.pm`）：
+- 建筑成本更高但起始资源丰厚（C:20, W:8）
+- 城镇特权 `special.TW*`：每达成一个城镇额外获得 `W:3`
+- SH 解锁特殊行动 `ACTS`：以 3C 建造 1 个 TP（费用折扣）
+- 全崇拜轨道各起步 1 位
+
+**Giants**（`src/Game/Factions/Giants.pm`）：
+- SH 解锁特殊行动 `ACTG`：花费 `W:2` 进行 2 铲改造（不受挖掘等级限制，固定 2 铲）
+- 普通挖掘按标准规则
+
+```javascript
+function do_faction_action_ACTG(G, role) {
+    // Giants SH 行动：2 铲改造，目标由玩家依次指定
+    pay(G.factions[role], { W: 2 })
+    // 压入 2 次 transform 子动作到 action_queue
+    G.action_queue.unshift(
+        { type: "transform", role, count: 2 }
+    )
+}
+```
+
+**测试重点：**
+- Engineers 桥梁使两格视为相邻：城镇 BFS 应连通桥接格
+- Swarmlings 城镇时自动 gain `W:3`
+- Giants `ACTG` 固定给 2 铲，不受当前挖掘等级限制
+
+**验收标准**：
+- Engineers 桥梁城镇连通测试通过
+- Swarmlings 城镇木材奖励测试通过
+- Giants SH 行动 2 铲测试通过
+
+---
+
+##### Step 3.6.4：资源转换型派系——Alchemists、Darklings、Auren
+
+**目标**：实现资源或神职（Priest）有特殊转换方式的三种派系。
+
+**Alchemists**（`src/Game/Factions/Alchemists.pm`）：
+- SH 建成后每用 1 铲额外获得 `PW:2`（`on_spade_gained` hook，条件 `SH >= 1`）
+- SH 建成时立即获得 `PW:12`（`advance_gain: [{ PW: 12 }]`，已由通用逻辑处理）
+- 特殊兑换率：`C:1 → VP:2`（卖金）；`VP:1 → C:1`（买金），在最终积分前可兑换
+
+```javascript
+function apply_exchange_rates(G, role) {
+    const f = G.factions[role]
+    if (!f.exchange_rates) return
+    // 每个兑换率提供一个可选行动，玩家可多次执行
+    // 在 generate_actions 里暴露 exchange 动作
+}
+```
+
+**Darklings**（`src/Game/Factions/Darklings.pm`）：
+- 挖掘方式不同：固定花费 `P:1`（神职）得 1 铲 + 2 VP，不可升级（`max_level: 0`）
+- SH 建成时立即将 3 名工人转换为 3 个神职（`CONVERT_W_TO_P: 3`）
+- SA 成本高（`W:4, C:10`）但神职收入更多（`P:2`）
+
+```javascript
+function do_dig_darklings(G, role) {
+    pay(G.factions[role], { P: 1 })
+    gain(G.factions[role], { VP: 2 })
+    // 返回 1 铲供调用方使用（terraform）
+}
+```
+
+**Auren**（`src/Game/Factions/Auren.pm`）：
+- SH 解锁特殊行动 `ACTA` + 立即获得 1 张优待牌（`advance_gain: [{ ACTA: 1, GAIN_FAVOR: 1 }]`）
+- `ACTA` 行动：花费 `PW:3`，在崇拜轨道上进 1 格（任意一条）
+- TP 收入中 PW 更多（高等级 TP：PW: 4 和 6）
+
+```javascript
+function do_faction_action_ACTA(G, role, cult) {
+    pay(G.factions[role], { PW: 3 })
+    advance_cult(G, role, cult, 1)
+    log(G, `${role} uses ACTA to advance ${cult}`)
+}
+```
+
+**测试重点：**
+- Alchemists 在 SH 建成前铲地不获得 PW；建成后每铲 +2PW
+- Darklings 挖掘扣 1 P，得 2 VP 和 1 铲；`max_level` 卡死为 0
+- Auren SH 建成时同时获得 `ACTA` 和 1 张 favor
+
+**验收标准**：
+- Alchemists 铲地 PW 触发条件测试通过
+- Darklings 挖掘特殊成本测试通过
+- Auren `ACTA` 崇拜推进测试通过
+
+---
+
+##### Step 3.6.5：征收型与变色型派系——Cultists、Shapeshifters
+
+**目标**：实现两种修改征收（leech）机制的派系。
+
+**Cultists**（`src/Game/Factions/Cultists.pm`）：
+- 当邻居征收权力时，Cultists 在 `leech_effect` 中：
+  - 若邻居 **接受** 征收：Cultists 在任意崇拜轨道进 1 格（玩家选择）
+  - 若邻居 **拒绝** 征收：Cultists 获得 `PW:1`
+
+```javascript
+// compute_leech 后，对目标派系的处理：
+function apply_leech_effect_to_cultists(G, cultists_role, leech_accepted) {
+    if (leech_accepted) {
+        // 压入选择崇拜轨道的子动作
+        G.action_queue.unshift({ type: "cultist-cult-choice", role: cultists_role })
+    } else {
+        gain(G.factions[cultists_role], { PW: 1 })
+    }
+}
+```
+
+**Shapeshifters**（`src/Game/Factions/Shapeshifters.pm`）：
+- 初始选颜色（`PICK_COLOR`），但在游戏中可以"变形"：花费权力改变自己的地形颜色
+- 当邻居征收时：Shapeshifters 的 `leech_effect.taken` 为 `GAIN_P3_FOR_VP`（从 P3 碗取回 1 个权力 token，但损失 1 VP）；拒绝时获得 `PW:1`
+- SH 解锁两个特殊行动 `ACTH5`、`ACTH6`：
+  - `ACTH5`：花费 `PW:4`，允许将 1 格地形改变为任意颜色（不须支付改造费）
+  - `ACTH6`：花费 `PW:4`，将己方颜色改为另一种颜色（shapeshift）
+
+```javascript
+function apply_leech_effect_shapeshifters(G, role, leech_accepted) {
+    if (leech_accepted) {
+        // GAIN_P3_FOR_VP: 移回一个 P3 为 P1，但扣 1 VP
+        const f = G.factions[role]
+        if (f.P3 > 0) {
+            f.P3--; f.P1++
+            gain(f, { VP: -1 })
+        }
+    } else {
+        gain(G.factions[role], { PW: 1 })
+    }
+}
+```
+
+**测试重点：**
+- Cultists：邻居接受征收 → Cultists 得 1 崇拜步（提示选轨道）
+- Cultists：邻居拒绝征收 → Cultists 得 1 PW
+- Shapeshifters leech accepted → P3减1、P1加1、VP减1
+- Shapeshifters leech denied → PW+1
+- Shapeshifters `ACTH5` 能把任意格改为任意颜色
+
+**验收标准**：
+- Cultists 的两种 leech 响应均通过测试
+- Shapeshifters 征收响应与变形行动测试通过
+
+---
+
+##### Step 3.6.6：高级移动派系——Riverwalkers 与 Dragonlords
+
+**目标**：实现两种基于"火山地形"和特殊可达性规则的 Fire & Ice 派系。
+
+**Riverwalkers**（`src/Game/Factions/Riverwalkers.pm`）：
+- 初始选颜色（`PICK_COLOR`），并且使用"解锁地形"系统
+- 无挖掘能力（铲子行动被完全禁止；`special.SPADE` → 直接丢弃）
+- 每得 1 名神职（P）= 解锁 1 种地形（`UNLOCK_TERRAIN`），解锁后可以建造在该颜色格上
+- 解锁同类地形：自己颜色=2C，其他颜色=1C
+- 航运固定 level=1，不可升级
+- SH 建成：获得 2 座桥（放置位置由玩家决定）
+- TE 3级时收入含 `PW:5`（与标准不同）
+
+```javascript
+// 解锁地形子动作
+function do_unlock_terrain(G, role, color) {
+    const f = G.factions[role]
+    if (f.unlocked_terrains.includes(color)) throw new Error("Already unlocked")
+    const cost = (color === f.color) ? { C: 2 } : { C: 1 }
+    pay(f, cost)
+    f.unlocked_terrains.push(color)
+    log(G, `${role} unlocks ${color} terrain`)
+}
+
+// is_reachable 对 Riverwalkers：允许建造在已解锁的颜色格（但仍需地图连接，且不走直接邻接）
+function is_reachable_riverwalkers(G, role, hex) {
+    // 1. 地形颜色必须在 unlocked_terrains 中
+    // 2. 从任意己方建筑出发，沿河流（river 格）BFS 可到达（不须陆地连接）
+}
+```
+
+**Dragonlords**（`src/Game/Factions/Dragonlords.pm`）：
+- 初始选颜色（`PICK_COLOR`），颜色为"火山"（实际选一种标准颜色）
+- 无挖掘成本（`dig.cost: [{}]`），每次挖掘得 1 个 `VOLCANO_TF`（火山改造标记）
+- 火山改造：可以将相邻格改造为火山色，也可在火山格上建造
+- 当己方建筑被其他派系"用作征收"时（volcano_effect）：
+  - 非己方颜色格：附近派系失去 1 个权力 token（P1 → 移除）
+  - 己方颜色格：失去 2 个权力 token
+- SH 建成：P1 碗获得与玩家数相等的权力 token（`P1: PLAYER_COUNT`）
+- 特殊行动 `BON1/ACT5/ACT6` 需要额外子动作放置目标
+
+```javascript
+function on_build_near_dragonlords(G, dragonlords_role, built_hex, built_faction_role) {
+    // volcano_effect: 对在 dragonlords 建筑附近新建建筑的派系施加惩罚
+    const effect = MAP_HEXES[built_hex].color === G.factions[dragonlords_role].color
+        ? { LOSE_PW_TOKEN: 2 }
+        : { LOSE_PW_TOKEN: 1 }
+    // 从 built_faction 的权力碗中移除 token
+    lose_pw_token(G.factions[built_faction_role], effect.LOSE_PW_TOKEN)
+}
+```
+
+**测试重点：**
+- Riverwalkers 在未解锁的颜色格不能建造
+- Riverwalkers 得到 1 P 即触发选择解锁地形的子动作
+- Dragonlords 在附近建造触发 `volcano_effect` 扣 token
+- Dragonlords SH 建成后 P1 碗增加`player_count`个 token
+
+**验收标准**：
+- Riverwalkers 地形解锁与建造限制测试通过
+- Dragonlords 火山效果测试通过
+
+---
+
+##### Step 3.6.7：Fire & Ice 扩展派系——Acolytes、Ice Maidens、Yetis
+
+**目标**：实现三种 Fire & Ice 扩展专属派系。仅当 `options.fire_ice = true` 时启用。
+
+**Acolytes**（`src/Game/Factions/Acolytes.pm`）：
+- 初始选颜色（`PICK_COLOR`），全崇拜轨道各起步 3 位
+- 无挖掘成本（`dig.cost: [{}]`），每次挖掘得 1 个 `VOLCANO_TF`（同 Dragonlords）
+- 特殊：每使用 1 铲，转换为崇拜轨道进 1 格（任意选），而非改变地形
+  - 即 `on_spade_gained` hook：`SPADE → CULT: 1`
+- 禁止 `BON1 / ACT5 / ACT6`（不能用产铲特殊行动）
+- SH 建成：`PRIEST_CULT_BONUS`——神职送入崇拜轨道时多进 1 格
+
+```javascript
+function on_spade_gained_acolytes(G, role, count) {
+    // 每铲换崇拜 1 步（压入选崇拜轨道的子动作）
+    for (let i = 0; i < count; i++) {
+        G.action_queue.unshift({ type: "choose-cult", role, source: "spade" })
+    }
+}
+```
+
+**Ice Maidens**（`src/Game/Factions/Icemaidens.pm`）：
+- 初始选颜色（`PICK_COLOR`）+ 初始获得 1 张优待牌
+- SH 解锁：`pass_vp` 机制——每在 pass 时，按当前 TE 数量获得 VP（0TE=0, 1TE=3, 2TE=6, 3TE=9）
+- SH 收入 `PW:4`（比标准高）
+- 挖掘升级费用中 C 权重更低（`advance_cost: { C:5, W:1, P:1 }`）
+
+```javascript
+function on_pass_icemaidens(G, role) {
+    const f = G.factions[role]
+    if (f.buildings.SH < 1) return
+    const te_count = f.buildings.TE || 0
+    const pass_vp_table = [0, 3, 6, 9]
+    const vp = pass_vp_table[te_count] || 0
+    gain(f, { VP: vp })
+    log(G, `${role} gains ${vp} VP from Ice Maidens pass ability`)
+}
+```
+
+**Yetis**（`src/Game/Factions/Yetis.pm`）：
+- 初始选颜色（`PICK_COLOR`）；起手 P2=12、P1=0
+- 全部 6 种权力行动（ACT1–ACT6）费用各减少 `PW:1`
+- SH 解锁：权力行动可以在同一轮中 **重复使用**（通常每种只能用 1 次每轮）
+- SH/SA 的建筑强度为 4（不是标准的 3）
+- `building_strength` 需要在派系级别覆盖默认值
+
+```javascript
+function get_power_action_cost(G, role, action_id) {
+    const base_cost = POWER_ACTIONS[action_id].cost
+    const f = G.factions[role]
+    if (f.name === "yetis" && f.discount?.[action_id]) {
+        return { ...base_cost, PW: base_cost.PW - 1 }    // PW -1
+    }
+    return base_cost
+}
+
+function can_use_power_action(G, role, action_id) {
+    const f = G.factions[role]
+    if (f.name === "yetis" && f.buildings.SH >= 1) return true    // 不受单次限制
+    return !G.pool.used_power_actions.has(action_id)
+}
+```
+
+**测试重点：**
+- Acolytes 使用铲子触发崇拜选择子动作而非地形改造
+- Acolytes 不能使用 `BON1/ACT5/ACT6`
+- Ice Maidens pass 时按 TE 数量获得 VP（SH 建成前不获得）
+- Yetis 权力行动成本比标准少 1 PW
+- Yetis SH 建成后权力行动可重复使用
+
+**验收标准**：
+- Acolytes / Ice Maidens / Yetis 的所有测试组通过
+- Fire & Ice 派系仅在 `options.fire_ice = true` 时出现在派系选择列表
+
+---
+
+##### Step 3.6.8：整合测试——20 种派系回归验证
+
+**目标**：对所有 20 种派系做最终整合验证，确保任意派系在完整游戏流程下不报错。
+
+**测试策略：**
+
+```javascript
+// test/test-step-3.6.js — 回归测试
+const ALL_FACTIONS = [
+    "alchemists", "auren", "chaosmagicians", "cultists", "darklings",
+    "dwarves", "engineers", "fakirs", "giants", "halflings",
+    "mermaids", "nomads", "swarmlings", "witches",
+    // Fire & Ice
+    "acolytes", "dragonlords", "icemaidens", "riverwalkers", "shapeshifters", "yetis",
+]
+
+// 对每种派系：setup → 选派系 → 初始居所 → 选奖励牌 → 收入 → 1次完整行动 → 不报错
+for (const faction_name of ALL_FACTIONS) {
+    test(`${faction_name} survives one full turn`, () => {
+        let G = setup(42, "Standard", { players: 2, fire_ice: true })
+        G = action(G, "Player 1", "select_faction", faction_name)
+        // ... 执行最小合法操作序列
+        assert.ok(G.log.length > 0)
+        assert.ok(G.result === null)  // 游戏未结束
+    })
+}
+```
+
+**额外回归点：**
+- 每种派系的 SH 解锁 `advance_gain` 正确执行（特殊行动 token 标记到位）
+- 每种派系的初始资源与 `data/factions.js` 定义完全吻合
+- 20 种派系不互相干扰（单人游戏模拟 2–5 人均正常）
+
+**验收标准**：
+- 所有 20 种派系的冒烟测试通过（无异常，状态合法）
+- `test/test-step-3.6.js` 全部测试通过
 
 ---
 
